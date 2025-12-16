@@ -7,12 +7,15 @@ import random
 import logging
 import json
 import asyncio
+import traceback
 from datetime import datetime
 from enum import Enum
 from json import JSONDecodeError
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 from pathlib import Path
 from uuid import uuid4
+from tree_sitter import Parser
+from tree_sitter_language_pack import get_language
 
 
 def setup_logger(name: str = "agent") -> logging.Logger:
@@ -59,7 +62,6 @@ def setup_logger(name: str = "agent") -> logging.Logger:
 class Config:
     MODEL_GLM_46 = "zai-org/GLM-4.6-FP8"
     MODEL_KIMI_K2 = "moonshotai/Kimi-K2-Instruct"
-    MODEL_DEEPSEEK_V3 = "deepseek-ai/DeepSeek-V3-0324"
     MODEL_QWEN3_CODER = "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8"
 
     GATEWAY_URL = os.getenv("SANDBOX_PROXY_URL", "http://localhost:1234")
@@ -68,74 +70,66 @@ class Config:
 
     NOT_FOUND_LITERAL = "Not found"
 
+    class TaskType(Enum):
+        REASONING = "reasoning"
+        THINKING = "thinking"
+        ANSWERING = "answering"
+
     TEMPERATURE_BY_MODEL_TASK = {
         MODEL_GLM_46: {
-            "planning": (0.3, 0.7),
-            "testing": (0.4, 0.8),
-            "coding": (0.0, 0.2),
-            "summarizing": (0.0, 0.3),
-            "evaluating": (0.0, 0.2),
+            TaskType.REASONING: (0.3, 0.7),
+            TaskType.THINKING: (0.0, 0.2),
+            TaskType.ANSWERING: (0.0, 0.3),
         },
         MODEL_KIMI_K2: {
-            "planning": (0.3, 0.7),
-            "testing": (0.4, 0.8),
-            "coding": (0.0, 0.2),
-            "summarizing": (0.0, 0.3),
-            "evaluating": (0.0, 0.2),
-        },
-        MODEL_DEEPSEEK_V3: {
-            "planning": (0.3, 0.7),
-            "testing": (0.4, 0.8),
-            "coding": (0.0, 0.2),
-            "summarizing": (0.0, 0.3),
-            "evaluating": (0.0, 0.2),
+            TaskType.REASONING: (0.3, 0.7),
+            TaskType.THINKING: (0.0, 0.2),
+            TaskType.ANSWERING: (0.0, 0.3),
         },
         MODEL_QWEN3_CODER: {
-            "planning": (0.3, 0.7),
-            "testing": (0.4, 0.8),
-            "coding": (0.0, 0.2),
-            "summarizing": (0.0, 0.3),
-            "evaluating": (0.0, 0.2),
+            TaskType.REASONING: (0.3, 0.7),
+            TaskType.THINKING: (0.0, 0.2),
+            TaskType.ANSWERING: (0.0, 0.3),
         },
     }
 
     MODEL_BY_TASK = {
-        "planning": [
-            MODEL_GLM_46,
-            MODEL_GLM_46,
-            MODEL_QWEN3_CODER,
+        TaskType.REASONING: [
             MODEL_KIMI_K2,
-            MODEL_DEEPSEEK_V3,
+            MODEL_KIMI_K2,
+            MODEL_QWEN3_CODER,
         ],
-        "testing": [
+        TaskType.THINKING: [
             MODEL_GLM_46,
             MODEL_GLM_46,
             MODEL_QWEN3_CODER,
-            MODEL_KIMI_K2,
-            MODEL_DEEPSEEK_V3,
         ],
-        "coding": [
-            MODEL_GLM_46,
-            MODEL_GLM_46,
+        TaskType.ANSWERING: [
             MODEL_QWEN3_CODER,
-            MODEL_KIMI_K2,
-            MODEL_DEEPSEEK_V3,
-        ],
-        "summarizing": [
-            MODEL_QWEN3_CODER,
-            MODEL_QWEN3_CODER,
-            MODEL_KIMI_K2,
-            MODEL_GLM_46,
-            MODEL_DEEPSEEK_V3,
-        ],
-        "evaluating": [
-            MODEL_KIMI_K2,
-            MODEL_KIMI_K2,
-            MODEL_DEEPSEEK_V3,
             MODEL_QWEN3_CODER,
             MODEL_GLM_46,
         ],
     }
+
+    VERSION_COMPATIBILITY_FIX = """
+    import sys, pytest, collections, collections.abc, urllib3.exceptions, _pytest.pytester, numpy;
+    collections.Mapping = collections.abc.Mapping;
+    collections.MutableMapping = collections.abc.MutableMapping;
+    collections.MutableSet = collections.abc.MutableSet;
+    collections.Sequence = collections.abc.Sequence;
+    collections.Callable = collections.abc.Callable;
+    collections.Iterable = collections.abc.Iterable;
+    collections.Iterator = collections.abc.Iterator;
+    urllib3.exceptions.SNIMissingWarning = urllib3.exceptions.DependencyWarning;
+    pytest.RemovedInPytest4Warning = DeprecationWarning;
+    _pytest.pytester.Testdir = _pytest.pytester.Pytester;
+    numpy.PINF = numpy.inf;
+    numpy.unicode_ = numpy.str_;
+    numpy.bytes_ = numpy.bytes_;
+    numpy.float_ = numpy.float64;
+    numpy.string_ = numpy.bytes_;
+    numpy.NaN = numpy.nan;
+    """
 
     logger = setup_logger()
 
@@ -183,6 +177,9 @@ class CustomError(Exception):
 
 
 class Utils:
+    _parsers = {}
+    _language_cache = {}
+
     @classmethod
     def get_git_patch(cls) -> str:
         """
@@ -314,16 +311,33 @@ class Utils:
         return True
 
     @classmethod
+    def _get_parser(cls, language: str):
+        if Parser is None or get_language is None:
+            return None
+        if language not in cls._parsers:
+            try:
+                lang_obj = get_language(language)
+                if lang_obj is None:
+                    return None
+                parser = Parser(lang_obj)
+                cls._parsers[language] = parser
+            except Exception as e:
+                Config.logger.warning(f"Error creating parser for {language}: {e}")
+                return None
+        return cls._parsers[language]
+
+    @classmethod
     def inference(
         cls,
         messages: list,
-        task_type: str,
+        task_type: Config.TaskType,
         tool_mode: str = "auto",
         tools: list = [],
         max_retries: int = 5,
         model_indx: int = 0,
     ) -> dict:
         retries = 0
+        model = ""
         url = f"{Config.GATEWAY_URL.rstrip('/')}/api/inference"
         headers = {"Content-Type": "application/json"}
         request_data = {
@@ -373,6 +387,7 @@ class Utils:
                 )
             except Exception as e:
                 err = CustomError(ErrorType.UNKNOWN_ERROR, f"model: {model} error: {e}")
+                traceback.print_exc()
             finally:
                 if err:
                     retries += 1
@@ -747,6 +762,32 @@ class Utils:
             )
 
     @classmethod
+    def _search_in_all_files(cls, grep_search_command: str) -> str:
+        result_prefix = f"Result of running {grep_search_command}\n"
+        cmd = grep_search_command.lstrip()
+        if not cmd.startswith("grep"):
+            return f"{result_prefix} Error: Invalid command. Expected a grep command but got: '{grep_search_command}'"
+        try:
+            result = subprocess.run(
+                ["bash", "-c", grep_search_command],
+                capture_output=True,
+                text=True,
+                timeout=45,
+            )
+        except Exception as e:
+            return f"{result_prefix} Error: Failed to execute grep command: {e}"
+        if result.returncode > 1:
+            error_msg = result.stderr.strip() or "Unknown error"
+            return f"{result_prefix} Error: Grep command failed with return code {result.returncode}: {error_msg}"
+        output = result.stdout
+
+        if not output.strip():
+            return f"{result_prefix} No matches found for pattern in codebase."
+        if Utils.count_tokens(output) > 3000:
+            return f"{result_prefix} Search results are too long. Please refine your search term into more specific terms."
+        return output
+
+    @classmethod
     def _edit_file(
         cls,
         path: str,
@@ -1027,6 +1068,250 @@ class Utils:
                 ErrorType.COMMAND_FAILED,
                 f"Error executing command '{command}': {str(e)}",
             )
+
+    @classmethod
+    def _run_code(
+        cls,
+        content: str,
+        file_path: str,
+        run_command: list[str],
+    ) -> str:
+        result_prefix = f"Result of running {" ".join(run_command)}\n"
+
+        if file_path.endswith((".py", ".pyw", ".pyx", ".pyi", ".pxd", ".pxi", ".pyz")):
+            content = Config.VERSION_COMPATIBILITY_FIX + "\n\n" + content
+        cls._create_file(file_path, content)
+        try:
+            result = subprocess.run(
+                run_command, capture_output=True, text=True, check=False, timeout=60
+            )
+            if result.returncode != 0:
+                return f"{result_prefix} Error running code: {result.stderr}"
+            return f"{result_prefix} {result.stdout}\n"
+        except Exception as e:
+            return f"{result_prefix} Error: {e}"
+
+    @classmethod
+    def _check_language(cls, source: str, file_path: str | None = None) -> str | None:
+        if (
+            file_path
+            and not os.path.exists(file_path)
+            or not source
+            or not source.strip()
+        ):
+            return None
+        if file_path:
+            file_path = os.path.abspath(file_path) if file_path else None
+            if file_path and file_path in cls._language_cache:
+                return cls._language_cache[file_path]
+        stripped_source = source.strip()
+        sample = (
+            stripped_source
+            if len(stripped_source) <= 1000
+            else f"{stripped_source[:500]}\n\n... [middle content omitted] ...\n\n{stripped_source[-500:]}"
+        )
+
+        detected_language = cls.inference(
+            [
+                {"role": "system", "content": Prompts.DETECT_PROGRAMMING_LANGUAGE},
+                {
+                    "role": "user",
+                    "content": f"Here is code snippet\n```\n{sample}\n```",
+                },
+            ],
+            Config.TaskType.ANSWERING,
+            "none",
+        )
+
+        if file_path:
+            cls._language_cache[file_path] = detected_language
+        return detected_language
+
+    @classmethod
+    def _is_identifier_node(self, node) -> bool:
+        return "identifier" in node.type.lower()
+
+    @classmethod
+    def _classify_node_type(self, node) -> tuple[str, int | None]:
+        node_type_str = node.type.lower()
+        if "function" in node_type_str or "method" in node_type_str:
+            for i, child in enumerate(node.children):
+                if self._is_identifier_node(child):
+                    return ("function", i)
+            return ("function", None)
+        elif "class" in node_type_str:
+            for i, child in enumerate(node.children):
+                if self._is_identifier_node(child):
+                    return ("class", i)
+            return ("class", None)
+        return ("other", None)
+
+    @classmethod
+    def _find_specific_function(
+        cls,
+        node,
+        source_lines: list[str],
+        target_qualified: str,
+        target_simple: str,
+        class_name: str = "",
+        parent_node=None,
+    ) -> dict | None:
+        if not node.children:
+            return None
+        node_type, name_child_index = cls._classify_node_type(node)
+        if node_type == "class":
+            name = None
+            if name_child_index is not None and name_child_index < len(node.children):
+                name_child = node.children[name_child_index]
+                name_start, name_end = name_child.start_point, name_child.end_point
+                if name_start[0] < len(source_lines):
+                    line = source_lines[name_start[0]]
+                    name = (
+                        line[name_start[1] : name_end[1]].strip()
+                        if name_start[0] == name_end[0]
+                        else line[name_start[1] :].strip()
+                    )
+            if not name and parent_node:
+                for child in parent_node.children:
+                    if cls._is_identifier_node(child) and child != node:
+                        name_start, name_end = child.start_point, child.end_point
+                        if name_start[0] < len(source_lines):
+                            line = source_lines[name_start[0]]
+                            name = (
+                                line[name_start[1] : name_end[1]].strip()
+                                if name_start[0] == name_end[0]
+                                else line[name_start[1] :].strip()
+                            )
+                            if name:
+                                break
+            if name:
+                new_class_name = f"{class_name}.{name}" if class_name else name
+                for child in node.children:
+                    result = cls._find_specific_function(
+                        child,
+                        source_lines,
+                        target_qualified,
+                        target_simple,
+                        new_class_name,
+                        node,
+                    )
+                    if result is not None:
+                        return result
+
+        elif node_type == "function":
+            name = internal_name = None
+            if name_child_index is not None and name_child_index < len(node.children):
+                name_child = node.children[name_child_index]
+                name_start, name_end = name_child.start_point, name_child.end_point
+                if name_start[0] < len(source_lines):
+                    line = source_lines[name_start[0]]
+                    internal_name = (
+                        line[name_start[1] : name_end[1]].strip()
+                        if name_start[0] == name_end[0]
+                        else line[name_start[1] :].strip()
+                    )
+            if parent_node:
+                for child in parent_node.children:
+                    if cls._is_identifier_node(child) and child != node:
+                        name_start, name_end = child.start_point, child.end_point
+                        if name_start[0] < len(source_lines):
+                            line = source_lines[name_start[0]]
+                            name = (
+                                line[name_start[1] : name_end[1]].strip()
+                                if name_start[0] == name_end[0]
+                                else line[name_start[1] :].strip()
+                            )
+                            if name:
+                                break
+            if not name:
+                name = internal_name
+            if name:
+                qualified_name = f"{class_name}.{name}" if class_name else name
+                is_qualified_target = "." in target_qualified
+                is_match = qualified_name == target_qualified or (
+                    not is_qualified_target and name == target_simple
+                )
+                if is_match:
+                    at_start = node.start_point[0]
+                    for i in range(at_start - 1, -1, -1):
+                        if source_lines[i].strip().startswith("@"):
+                            at_start = i
+                        elif source_lines[i].strip():
+                            break
+                    return {
+                        "start_line": at_start + 1,
+                        "end_line": node.end_point[0] + 1,
+                    }
+            for child in node.children:
+                result = cls._find_specific_function(
+                    child,
+                    source_lines,
+                    target_qualified,
+                    target_simple,
+                    class_name,
+                    node,
+                )
+                if result is not None:
+                    return result
+        for child in node.children:
+            result = cls._find_specific_function(
+                child, source_lines, target_qualified, target_simple, class_name, node
+            )
+            if result is not None:
+                return result
+        return None
+
+    @classmethod
+    def _get_function_body(
+        cls, file_path: str, function_name: str, add_line_numbers: bool = False
+    ) -> str:
+        if not function_name:
+            return "Error: Provide function name explicitly"
+        if not os.path.exists(file_path):
+            return f"Error: {file_path} file doesn't exist"
+
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                source = f.read()
+        except Exception as e:
+            return f"Error reading file {file_path}: {e}"
+
+        if not source or Parser is None:
+            return ""
+        try:
+            source_bytes, source_lines = bytes(source, "utf8"), source.splitlines()
+            language = cls._check_language(source, file_path=file_path)
+            if not language:
+                return ""
+            parser = cls._get_parser(language)
+            if parser is None:
+                return ""
+            tree = parser.parse(source_bytes)
+            target_qualified, target_simple = (
+                function_name,
+                function_name.split(".")[-1],
+            )
+            func_info = cls._find_specific_function(
+                tree.root_node, source_lines, target_qualified, target_simple
+            )
+            if func_info is None:
+                return ""
+            start_idx, end_idx = func_info["start_line"] - 1, func_info["end_line"] - 1
+            if 0 <= start_idx < len(source_lines) and 0 <= end_idx < len(source_lines):
+                body_lines = source_lines[start_idx : end_idx + 1]
+                return (
+                    "\n".join(
+                        f"{start_idx + i + 1}| {line}"
+                        for i, line in enumerate(body_lines)
+                    )
+                    if add_line_numbers
+                    else "\n".join(body_lines)
+                )
+        except Exception as e:
+            Config.logger.warning(
+                f"Error finding function {function_name} in {file_path}: {e}"
+            )
+        return ""
 
 
 class Tools:
@@ -1313,6 +1598,15 @@ class Tools:
         except CustomError as e:
             return f"Error [{e.error_type.value}]: {e.message}"
 
+    def search_in_all_files_content(cls, grep_search_command: str) -> str:
+        """
+        Performs grep search across all files in the codebase.
+
+        Arguments:
+            grep_search_command: grep search command to locate (e.g., "grep <your grep command>").
+        """
+        return Utils._search_in_all_files(grep_search_command)
+
     @classmethod
     def search_in_file(
         cls,
@@ -1381,6 +1675,56 @@ class Tools:
         except CustomError as e:
             return f"Error [{e.error_type.value}]: {e.message}"
 
+    @classmethod
+    def run_code(cls, content: str, file_path: str, run_command: list[str]) -> str:
+        """
+        Runs any code. You can use this tool directly to run any test code or bug reproduction code.
+        Saves the code at the given file_path and then runs it.
+        Do not use this tool to create test or files to reproduce the error unless user has specifically asked you to create test files as part of problem statement.
+
+        Arguments:
+            content: text code to write in file
+            file_path: path of the file to save the code in. This file should always be in the current working directory.
+            run_command: command to run the file (i.e., ["python", "file.py"] or ["node", "file.js"] etc)
+        """
+        return Utils._run_code(
+            content,
+            file_path,
+            run_command,
+        )
+
+    @classmethod
+    def get_function_body(cls, file_path: str, function_name: str) -> str:
+        """
+        Retrieves the complete body of a function from a file, including decorators.
+        Arguments:
+            file_path: filesystem path to target file.
+            function_name: name of the function to retrieve (supports both qualified names like "ClassName.method_name" and simple names like "method_name").
+        Returns:
+            The complete function body including decorators, or empty string if function not found.
+        """
+        return Utils._get_function_body(file_path, function_name, add_line_numbers=True)
+
+    @classmethod
+    def think(cls, thought: str) -> str:
+        """
+        Use the tool to think about something.
+        It will not obtain new information or make any changes to the repository, but just log the thought. Use it when complex reasoning or brainstorming is needed.
+        For example, if you explore the repo and discover the source of a bug, call this tool to brainstorm several unique ways of fixing the bug, and assess which change(s) are likely to be simplest and most effective.
+        Alternatively, if you receive some test results, call this tool to brainstorm ways to fix the failing tests.
+
+        Arguments:
+            thought: Your thoughts.
+        """
+        return "ok"
+
+    @classmethod
+    def finish(cls):
+        """
+        Signals completion of the current workflow execution
+        """
+        return "finish"
+
 
 class TimeoutHandler:
     """Handler for managing execution timeouts with graceful interruption."""
@@ -1418,8 +1762,6 @@ class Agent:
         self,
         system_inst: str,
         user_inst: str,
-        eval_inst: str,
-        task_type: str,
         repo_dir: str,
         summary_length: int = 15,
         retain_length: int = 15,
@@ -1437,8 +1779,6 @@ class Agent:
         self.base_length = 3
         self.system_inst = system_inst
         self.user_inst = user_inst
-        self.eval_inst = eval_inst
-        self.task_type = task_type
         self.summarization = ""
         self.summary_length = summary_length
         self.retain_length = retain_length
@@ -1462,9 +1802,7 @@ class Agent:
         if len(self.messages) - self.retain_length < self.summary_length:
             return
 
-        Config.logger.info(
-            f"[SUMMARIZING({self.task_type})]: {self.summary_length} messages..."
-        )
+        Config.logger.info(f"[SUMMARIZING]: {self.summary_length} messages...")
 
         messages_to_summarize = self.messages[
             self.base_length : self.base_length + self.summary_length
@@ -1501,13 +1839,13 @@ This is inference history.
         ]
         response = Utils.inference(
             messages,
-            "summarizing",
+            Config.TaskType.ANSWERING,
             "none",
         )
         self.summarization = response["content"]
 
         Config.logger.info(
-            f"[SUMMARIZED({self.task_type})]: {Utils.count_tokens(messages_content)} -> {Utils.count_tokens(self.summarization)} tokens \n{self.summarization}"
+            f"[SUMMARIZED]: {Utils.count_tokens(messages_content)} -> {Utils.count_tokens(self.summarization)} tokens \n{self.summarization}"
         )
         self.messages = (
             self.messages[: self.base_length]
@@ -1536,17 +1874,14 @@ This is inference history.
                     repeated = False
                     break
             if repeated:
-                Config.logger.warning(f"[REPEATED({self.task_type})]: {repeat} tools")
+                Config.logger.warning(f"[REPEATED]: {repeat} tools")
                 for i in range(repeat):
                     Config.logger.warning(
-                        f"\t[TOOL CALL {i+1}({self.task_type})]: {json.dumps(self.tool_calls[-repeat+i])}\n"
+                        f"\t[TOOL CALL {i+1}]: {json.dumps(self.tool_calls[-repeat+i])}\n"
                     )
                 self._rebase_to_tool_call(-2 * repeat)
                 return True
         return False
-
-    def _eval_result(self, result_like) -> bool:
-        return self.eval_inst in result_like
 
     def _tool_call_fault_tolerant(self, content):
         try:
@@ -1555,7 +1890,7 @@ This is inference history.
                     {"role": "system", "content": Prompts.TOOL_CALL_FAULT_TOLERANT},
                     {"role": "user", "content": content},
                 ],
-                "summarizing",
+                Config.TaskType.ANSWERING,
                 "none",
             )
             Config.logger.info(f"[TOOL TOLERANT]: {json.dumps(response)}")
@@ -1571,6 +1906,7 @@ This is inference history.
                 for tool_arg in tool_call["arguments"]:
                     if "name" not in tool_arg or "value" not in tool_arg:
                         return None
+            response["content"] = response.get("content", "")
             return response
         except Exception as e:
             Config.logger.error(f"[TOOL TOLERANT]: {e}")
@@ -1584,18 +1920,13 @@ This is inference history.
 
         while True:
             if retries >= max_retries:
-                Config.logger.error(
-                    f"[INFERENCE MAX RETRY({self.task_type})]: {max_retries}. Returning {self.result[:30]}..."
-                )
-                return self.result
-
-            with open(f"../logs/{self.task_type}.txt", "w") as f:
-                f.write(json.dumps(self.messages, indent=2))
+                Config.logger.error(f"[INFERENCE MAX RETRY]: {max_retries}.")
+                return
 
             # Check for timeout before each iteration
             if self.timeout_handler and self.timeout_handler.check():
                 Config.logger.error(
-                    f"[AGENT TIMEOUT({self.task_type})]: Agent execution exceeded {self.timeout_handler.timeout_seconds}s timeout"
+                    f"[AGENT TIMEOUT]: Agent execution exceeded {self.timeout_handler.timeout_seconds}s timeout"
                 )
                 raise CustomError(
                     ErrorType.AGENT_TIMEOUT,
@@ -1606,7 +1937,7 @@ This is inference history.
 
             response = Utils.inference(
                 self._messages_with_simmarization(),
-                self.task_type,
+                Config.TaskType.REASONING,
                 tool_mode,
                 tools,
             )
@@ -1616,27 +1947,17 @@ This is inference history.
 
             if not response["tool_calls"] and not response["content"]:
                 retries += 1
-                Config.logger.error(
-                    f"[NO INFERENCE RESULT({self.task_type})]: ({retries}/{max_retries})"
-                )
+                Config.logger.error(f"[NO INFERENCE RESULT]: ({retries}/{max_retries})")
                 continue
 
             if not response["tool_calls"]:
-                if self._eval_result(response["content"]):
-                    self.result = response["content"]
-                    return self.result
-                else:
-                    Config.logger.warning(
-                        f"[NON RESULT({self.task_type})]: Evaluated as non-result text.\n{response["content"]}"
-                    )
-                    response = self._tool_call_fault_tolerant(response["content"])
-                    if not response:
-                        continue
-                    response["content"] = response.get("content", "")
+                Config.logger.warning(f"[NO TOOL CALLS]: {response["content"]}")
+                response = self._tool_call_fault_tolerant(response["content"])
+                if not response:
+                    Config.logger.error(f"[NO INFERENCE RESULT] {response}")
+                    continue
 
-            Config.logger.info(
-                f"[INFERENCE CONTENT({self.task_type})]: {response["content"]}"
-            )
+            Config.logger.info(f"[INFERENCE CONTENT]: {response["content"]}")
 
             if response["content"]:
                 self.messages.append(
@@ -1649,13 +1970,17 @@ This is inference history.
             if not response["tool_calls"]:
                 continue
 
-            tool_names = [tool["name"] for tool in response["tool_calls"]]
-            tool_args = [
+            tool_name_list = [tool["name"] for tool in response["tool_calls"]]
+            tool_args_list = [
                 {arg["name"]: arg["value"] for arg in tool["arguments"]}
                 for tool in response["tool_calls"]
             ]
             self.tool_calls.append(
-                {"index": len(self.messages), "names": tool_names, "args": tool_args}
+                {
+                    "index": len(self.messages),
+                    "names": tool_name_list,
+                    "args": tool_args_list,
+                }
             )
             tool_call_outputs = []
 
@@ -1663,7 +1988,7 @@ This is inference history.
                 if retries < max_retries:
                     retries += 1
                     Config.logger.warning(
-                        f"[REBASE REPEATED({self.task_type})]: ({retries}/{max_retries})"
+                        f"[REBASE REPEATED]: ({retries}/{max_retries})"
                     )
                     continue
 
@@ -1676,6 +2001,9 @@ This is inference history.
                     else ({})
                 )
                 tool_output = "No response"
+
+                if tool_name == "finish":
+                    return
 
                 if hasattr(Tools, tool_name) and callable(getattr(Tools, tool_name)):
                     tool = getattr(Tools, tool_name)
@@ -1707,7 +2035,7 @@ This is inference history.
 
                 tool_output_preview = tool_output.split("\n")[:5]
                 Config.logger.info(
-                    f"[TOOL CALL({self.task_type})]: {tool_name}({json.dumps(kwargs, indent=4)}) \n\t[ANSWER]: {"\n".join(tool_output_preview)}"
+                    f"[TOOL CALL]: {tool_name}({json.dumps(kwargs, indent=4)}) \n\t[ANSWER]: {"\n".join(tool_output_preview)}"
                 )
 
             self.tool_outputs.append(tool_call_outputs)
@@ -1716,207 +2044,461 @@ This is inference history.
 
 
 class Prompts:
-    PLANNING_INSTRUCTION = """
-    Role:
-        You are a senior software engineer responsible for writing detailed plan to implement a software engineering task. You are only allowed to make plan, NOT for actual implementation.
+    REASONING_INSTRUCTION = """
+# Software Engineering Agent - Universal Task Prompt
 
-    Environment:
-        - No internet access.
-        - Supported languages: Python, Node.js (JavaScript/TypeScript).
-        - Task types: implement feature, fix bug(s), refactor, or design new module.
-        - Constraint: Do NOT write or change the repository code. Produce a planning and review artifact only.
-        - You will receive:
-            1. Problem statement to solve.
-            2. The repository contents or relevant files as context.
+## Role and Context
 
-    Goals:
-        For each assigned task, produce a plan that an LLM can follow to implement or fix the code with accurate and minimal changes.
-        Do NOT attempt to reproduce the error; it is already known, and the plan is intended for an LLM, NOT a human.
+You are a senior software engineering agent capable of implementing, modifying, and debugging code. You will be provided with a task that requires solving a software engineering problem.
 
-    Required output format (JSON-like / Markdown):
-        Always mention that, "Planning work is fully completed."
+**CRITICAL CONTEXT:**
+- The problem statement is the authoritative source of truth
+- Both source code AND test files may contain errors or be missing
+- You have everything needed in the repository - no internet connection required
+- There are hidden tests that must pass beyond the visible test cases
+- Initial solutions and test cases may be auto-generated and contain errors
 
-        1. Summary
-            - 1-2 sentence description of the task in your own words.
-            - Key deliverables.
+## High-Level Problem Solving Strategy
 
-        2. Preconditions & Inputs
-            - Files, functions, dependencies, environment needed.
-            - All relevant code snippets the context is aware of. You MUST designate the exact line numbers for the code snippets included.
-            File: path/to/file1.py (lines 120-140)
-            ```
-            # THE EXACT, FULL CODE HERE
-            ```
+1. **Understand the problem deeply** - Read carefully and identify requirements, ambiguities, and potential misunderstandings
+2. **Investigate the codebase** - Explore relevant files, search for patterns, and gather context
+3. **Generate initial solution and tests (if needed)** - For new implementations, create initial code and test files first
+4. **Identify edge cases and root causes** - Think critically about boundaries, errors, and core issues
+5. **Develop a clear plan** - Break down the solution into manageable, incremental steps
+6. **Implement changes incrementally** - Make small, testable modifications
+7. **Test frequently** - Verify correctness after each change
+8. **Debug as needed** - Use systematic debugging techniques to isolate issues
+9. **Iterate until perfect** - Continue refining until all tests pass and requirements are met
+10. **Final validation** - Reflect comprehensively and test edge cases rigorously
 
-            File: path/to/file2.py (lines 200-250)
-            ```
-            # THE EXACT, FULL CODE HERE
-            ```
-            - If any input is missing, list the exact file paths, function names, or data needed.
+## Detailed Workflow
 
-        3. High-level plan step-by-step
-            - Short numbered list of major phases.
+### 1. Deeply Understand the Problem
 
-        4. Detailed subtask breakdown
-            For each subtask provide:
-            - ID and title  
-            (e.g., S1: Add validation for X)
-            - Objective  
-            (one concise sentence)
-            - Inputs
-                * Provide a directory tree showing only the relevant files.
-                * Include all relevant **actual code snippets** (NOT placeholders).  
-                Each snippet must be preceded by its file path and line numbers. Example:
-                    File: path/to/file.py (lines 120-148)
-                    ```
-                    # INSERT THE EXACT, FULL CODE HERE
-                    ```
-                The snippet must contain the real code, not a summary, not ellipses, not just file paths.
-            - Outputs
-                * File paths and exact line numbers where code must be added, modified, or removed.
-                * Include updated or reference code snippets, each with file path and line numbers, following the required structure.
-            - Step-by-step actions (numbered)
-                * Each step must be concrete and immediately executable.  
-                (e.g., "Add parameter parsing in `path/to/file.js` between lines 45-78".)
-            - Assumptions, risks, and edge cases
-            - Complexity: low / medium / high
+- Carefully read the problem statement and requirements
+- Identify what behavior is expected and what success looks like
+- Identify potential misunderstanding points and ambiguous requirements
+- Think critically about what might be causing any discrepancies
+- Consider whether this is a symptom or the root cause
 
-    Inference rules:
-        - Always make tool calls unless you are finishing with final output.
-        - Do NOT invoke the same tool consecutively with identical arguments.
-        - Do NOT request information already available in the context.
-        - Batch as many tool calls as possible in a single step.
-    """
+**Common Analysis Points:**
+- Boundary conditions (empty inputs, null values, max/min sizes)
+- Invalid inputs and error handling requirements
+- Ambiguous requirements that could be misinterpreted
+- Common pitfalls and corner cases
+- Complex scenarios that might not be obvious
+- Type coercion, case sensitivity, off-by-one errors
+- Default parameter behavior vs. explicit values
 
-    CODING_INSTRUCTION = """
-    Role:
-        You are a senior software engineer responsible for autonomously implementing code changes exactly according to the provided step-by-step plan.
+### 2. Codebase Investigation
 
-    Environment:
-        - No internet access.
-        - Supported languages: Python, Node.js (JavaScript/TypeScript).
-        - You will receive:
-            1. A detailed task plan with subtasks, required files, and code snippet references.
-            2. The repository contents or relevant files as context.
+**CRITICAL: Find working examples first, then identify what needs to be done**
 
-    Responsibilities:
-        - Implement ONLY what is specified in the plan.
-        - Apply code changes using diff/patch tool calls (or editor tools).
-        - Run tests frequently using the available testing tools. If tests fail, analyze failures and revise your patch.
-        - Write additional tests if needed to capture important behaviors or edge cases.
-        - Ensure all tests pass before finalizing.
-        - If repository code differs from plan snippets, trust the repository and report the mismatch.
-        - Keep diffs minimal, targeted, and high quality.
-        - Write clean, safe, maintainable production-level code.
+- Search for key terms from the problem throughout the codebase
+- Find similar functionality that WORKS correctly - this is your template
+- Study how working code accomplishes what you need
+- Review existing similar functionality for patterns and conventions
+- Understand the project structure and where code should live
+- Identify existing utilities, helpers, or base classes to leverage
+- Check for coding standards, naming conventions, and architectural patterns
+- Review any automatically generated code or scaffolding (both source and tests)
+- Look beyond surface symptoms - search in domains, helpers, utilities, base classes
+- Trace to where mechanisms are actually DEFINED, not just where they're called
+- Find the ROOT files where functionality is implemented
 
-    Rules:
-        - You MUST NOT ask the user any questions. Tool calls are allowed, but natural-language questions are strictly forbidden.
-        - Never output speculative or hypothetical code.
-        - Follow the plan exactly and completely.
-        - When a next step exists, proceed immediately.
-        - If a step seems ambiguous, request missing artifacts via tool call (never via question).
-        - Do NOT request information already available in the context.
-        - Do NOT invoke the same tool consecutively with identical arguments.
-        - Batch as many tool calls as possible in a single step.
+**Trace Data Flow:**
+- Start with working feature's final output, trace backwards to find generator
+- If something isn't working, start with the problematic output and trace backwards to find what's missing
+- Compare the paths: where do they diverge?
+- Don't stop at the first file - keep tracing back to where behavior originates
+- Compare working vs non-working code: what's different? Missing calls? Missing imports?
 
-    Deliverables:
-        - Fully implemented code changes.
-        - All relevant tests passed.
-        - No commentary outside what the plan expects.
-        - No questions. No confirmations.
-        - End your response with a brief confirmation explicitly including "Coding work is fully completed.".
-    """
+**General Investigation:**
+- Read and understand relevant code snippets
+- Validate and update your understanding continuously as you gather context
+- Search broadly: domain logic, helpers, utilities, base classes, configurations
+- Look for patterns that might need similar treatment in multiple locations
 
-    TESTING_INSTRUCTION = """
-    Role:
-        You are a senior software engineer responsible for writing tests that evaluate the correctness of a specific task implementation.
+### 3. Generate Initial Solution and Tests (When Implementing New Features)
 
-    Environment:
-        - No internet access.
-        - Supported languages: Python, Node.js (JavaScript/TypeScript).
-        - You will receive:
-            1. A task description.
-            2. A detailed implementation plan.
-            3. The repository contents for all relevant files.
-        - Do NOT work on the task itself. Only work on writing tests to evaluate the implementation once completed.
-        - Task types include: implementing a feature, fixing bug(s), refactoring, or designing a new module.
-        - Tasks are not implemented. Just generate test scripts, not trying to run them.
+**IMPORTANT: When implementing new functionality, prefer to generate an initial solution and tests FIRST, then iterate to fix them.**
 
-    Goals:
-        You write a SINGLE test file with MULTIPLE test cases that will validate the code after the task is implemented.
-        You can refer to existing tests which are relevant while writing tests.
-        Make sure to generate accurate, thorough, efficient, and edge-case-complete tests.
+This approach allows you to:
+- Establish a baseline implementation quickly
+- Create test cases that validate the requirements
+- Iterate and refine both code and tests together
+- Catch misunderstandings early through test failures
 
-    Rules:
-        - Always make tool calls unless you are finishing with final output.
-        - Do NOT invoke the same tool consecutively with identical arguments.
-        - Do NOT request information already provided in the context.
-        - Batch as many tool calls as possible into a single step.
-        - Generate thorough, efficient, and edge-case-complete tests.
-        - When adding tests, prefer using built-in test frameworks (e.g., `unittest`, `node:test`, `node:assert`) if possible.
-        - For existing tests, refer to ONLY the ones which are relevant to provided task. Do NOT care about not relevant tests.
-        - If testing the task result is too complex and tricky, include instruction to type check at minimal in the output.
+**Initial Generation Process:**
+1. **Generate source code** - Create the initial implementation based on requirements and patterns from the codebase
+2. **Generate test files** - Write comprehensive test cases covering:
+- Basic functionality
+- Edge cases identified in step 1
+- Error handling scenarios
+- Integration with existing code
+3. **Run initial tests** - Execute the tests to establish a baseline
+4. **Iterate to fix** - Use the workflow below to refine both source and tests until all tests pass
 
-    Required output format (JSON-like / Markdown):
-        Always mention that, "Testing work is fully completed."
+**What to include in initial generation:**
+- Follow existing project structure and conventions
+- Use similar patterns found in working code
+- Include placeholder logic that can be refined
+- Write tests that validate requirements, not implementation details
+- Cover edge cases from the beginning
 
-        1. Newly added test cases with explanation.
-        2. Bash command to run the test cases.
+### 4. Root Cause Identification & Edge Case Analysis
+
+**Root Cause Verification:**
+
+Before implementing any changes, verify you understand the root cause:
+
+**Trace the COMPLETE data flow:**
+1. Find similar WORKING feature
+2. Trace working feature through all stages from start to final output
+3. Trace problematic feature through all stages from start to final output
+4. Find EXACT point where paths diverge
+
+**Compare at EACH stage:**
+- What does working code do that the current code doesn't?
+- What functions are called? What imports exist?
+- Where does the behavior differ?
+- Keep tracing backwards until you find the root cause
+
+**Find root, not symptoms:**
+- Don't patch surface symptoms - find the missing or different mechanism
+- Trace all the way back to where the behavior originates
+- The fix location may be far from where symptoms appear
+- Compare: How does working feature accomplish the task? How does current feature differ?
+
+**Search comprehensively:**
+- Is this pattern missing in multiple places? Search the whole repository
+- Are there similar files/classes that need the same changes?
+- Fix all instances, not just one example
+
+**Edge Case Analysis:**
+
+**Always identify and handle edge cases BEFORE implementing main logic:**
+- Empty/null inputs
+- Boundary values (zero, negative, maximum, minimum)
+- Invalid inputs and error handling
+- Special conditions and corner cases
+- Overflow/underflow conditions for numeric operations
+- String edge cases (empty strings, special characters, unicode)
+- Collection edge cases (empty arrays, single elements, duplicates)
+
+**Watch for common misunderstandings:**
+- Ambiguous requirements - clarify assumptions explicitly
+- Off-by-one errors in loops and indexing
+- Case sensitivity in string comparisons
+- Type coercion and implicit conversions
+- Default parameter behavior vs. explicit values
+- Null vs. undefined vs. empty string/array
+
+### 5. Exception and Error Handling
+
+- Identify opportunities to implement exception handling
+- Ensure error handling doesn't introduce new bugs or break existing functionality
+- Maintain backward compatibility
+- Validate at system boundaries (user input, external APIs)
+- Don't add error handling for scenarios that can't happen
+- Trust internal code and framework guarantees
+- Provide clear, actionable error messages
+- Handle error cases gracefully and meaningfully
+
+### 6. Develop a Detailed Plan
+
+**Use the think tool to outline your approach:**
+- Break down the solution into specific, simple, verifiable steps
+- Make each step small and incremental
+- Identify which files need to be modified or created
+- Specify the order of implementation
+- Plan for testing at each stage
+
+**Planning considerations:**
+- List components/functions to implement or modify
+- Define data structures and interfaces
+- Plan test cases for each feature
+- Consider integration points
+- List files that need modification
+- Specify exact changes needed at each location
+- Plan verification steps
+- Consider similar issues or needs elsewhere
+
+### 7. Making Code Changes
+
+**General Principles:**
+- **Before editing, ALWAYS read the relevant file contents** to ensure complete context
+- Make small, testable, incremental changes
+- Keep changes minimal and focused - don't refactor unrelated code
+- Use the appropriate edit tool and ensure patches apply correctly
+- If a patch fails, re-read the file and try again
+
+**Implementation Guidelines:**
+- Start with core functionality, then add edge case handling
+- Follow existing patterns and conventions in the codebase
+- Write clean, readable, maintainable code
+- **Copy patterns from working code - make minimal focused changes**
+- **Use the EXACT same pattern as working code**: same functions, imports, structure
+- Fix root cause, not symptoms
+- **Search for similar locations**: Is this pattern needed elsewhere?
+- Fix all instances if it's systemic
+- Trace back to where mechanisms are defined, not just where they're called
+- The fix location is often far from where the problem first appears
+
+**Avoid Over-Engineering:**
+- Don't add features beyond what was asked
+- Implement what's needed, not hypothetical features
+- Don't add unnecessary abstractions, utilities, or helpers
+- Only add comments where logic isn't self-evident
+- Don't add docstrings, type annotations, or comments to unchanged code
+- Don't add error handling for scenarios that can't happen
+- Don't create helpers for one-time operations
+- Don't design for hypothetical future requirements
+- Three similar lines is better than premature abstraction
+- Simple solutions don't need extra configurability
+
+**Backward Compatibility:**
+- Code must be backward compatible unless explicitly stated otherwise
+- Don't use compatibility hacks like renaming to `_var`, re-exporting removed types, or `// removed` comments
+- If something is unused, delete it completely
+
+### 8. Test File Management
+
+**Test Principles:**
+- Fix test files if they conflict with the problem statement using the edit tool
+- Test cases should validate requirements, not implementation details
+- Add test cases for all identified edge cases
+- Test exception cases explicitly
+- If tests fail repeatedly and contradict the problem statement, fix the test
+- Use the edit tool for test file modifications
+- Ensure tests validate the correct behavior
+
+**General Testing Principles:**
+- Don't create new test files unless absolutely necessary
+- Always check both expected output in problem statement AND in test cases
+- Write tests for edge cases you identified
+- Ensure tests are deterministic and repeatable
+- When generating initial solutions, create comprehensive test files
+- Tests should cover basic functionality, edge cases, and error handling
+
+### 9. Testing and Verification
+
+**Test frequently using provided tools:**
+- Run tests after EACH change to verify correctness
+- Don't batch multiple changes before testing
+- Use the appropriate testing tool rather than shell commands directly
+- Test edge cases explicitly - don't assume they're covered
+
+**Critical Testing Areas:**
+- Empty inputs and null values
+- Boundary values (zero, negative, max/min)
+- Invalid inputs
+- Corner cases and special conditions
+- All identified edge cases from step 4
+- Exception handling paths
+
+**If tests fail:**
+- Analyze the failure carefully
+- Determine if it's the code or the test that's wrong
+- Revise your approach based on the failure
+- Re-run tests to verify the fix
+
+**Failing to test edge cases rigorously is the NUMBER ONE failure mode**
+
+### 10. Debugging (When Needed)
+
+**Systematic Debugging:**
+- **Fix root cause, not symptoms**
+- **Search broadly across the repository**
+- Make changes only with high confidence they solve the problem
+- Don't just patch calling code - trace to where mechanism is defined
+- The fix location is often far from where problem is noticed
+- Use print statements, logs, or temporary code to inspect state
+- Add descriptive messages to understand what's happening
+- Revisit assumptions if unexpected behavior occurs
+- Look for similar patterns that might need the same fix
+- Debug for as long as needed to identify the root cause
+- Use systematic elimination of possibilities
+
+### 11. Iteration
+
+**Continue refining until:**
+- All visible tests pass
+- All edge cases are handled
+- Requirements match the problem statement exactly
+- Code is clean, readable, and maintainable
+- No backward compatibility is broken
+- Changes are exhaustive across the codebase
+
+**Don't stop prematurely:**
+- Hidden tests must also pass
+- Edge cases must be verified
+- The solution must be robust and comprehensive
+- NEVER GIVE UP without solving the problem completely
+- Feature implements all requirements
+- Edge cases are properly handled
+- Tests cover all functionality
+- Code is maintainable and follows best practices
+- Root cause is fixed, not just symptoms
+- Similar issues elsewhere are also addressed
+- Working features remain working
+- Changes are minimal and focused
+
+### 12. Final Reflection and Validation
+
+**Comprehensive reflection:**
+- Think carefully about the original intent and problem statement
+- Consider potential scenarios not covered by existing tests
+- Write additional tests that would validate correctness
+- Run new tests and ensure they pass
+- Be aware of hidden tests that must also pass
+
+**Final checklist:**
+- Requirements are fully met
+- All edge cases are handled
+- All tests pass (visible and your additional ones)
+- Code follows project conventions
+- No backward compatibility broken
+- Changes are exhaustive and don't break other functionality
+- Solution is robust and comprehensive
+
+## Critical Requirements
+
+**Universal Requirements:**
+- **Backward compatibility**: Code must be backward compatible unless explicitly stated otherwise
+- **Exhaustive changes**: Thoroughly check entire codebase to ensure changes don't break functionality
+- **File creation**: Don't create new files unless absolutely necessary (exception: initial solution generation)
+- **Output validation**: Check both expected output in problem statement AND in test cases
+- **No internet**: If dependencies are missing, don't try to solve it - you have no internet access
+- **Complete the task**: Never claim a task is too large or that you lack time
+- **Think before acting**: Plan extensively before function calls and reflect on outcomes
+- **Use tools appropriately**: Choose the right tool for the job and use it correctly
+- **Find and fix root causes**: Don't just address symptoms - trace to the source
+- **Search comprehensively**: Fix similar issues throughout codebase
+- **Copy working patterns**: Leverage what already works with exact same patterns
+- **Handle all edge cases**: Before considering task complete, test edge cases explicitly
+- **Generate then iterate**: For new features, generate initial solution and tests first, then fix
+
+## Step Efficiency
+
+You have a limited step budget:
+- **Target**: 5-15 steps for straightforward tasks
+- **Maximum**: 30 steps for complex tasks
+
+**Efficiency guidelines:**
+- Prioritize simpler, faster solutions
+- Make forward progress with each step
+- Test frequently to catch issues early
+- Don't over-investigate - implement once you understand
+- Balance thoroughness with efficiency
+- Use think tool to plan before acting
+- Generate initial solutions quickly, then iterate
+
+## Tool Usage Guidelines
+
+**Choose the right tool:**
+- Use file reading tools for understanding context
+- Use search tools to find patterns and similar code
+- Use edit tools for modifying existing files
+- Use write tools for generating initial solutions and new files
+- Use test execution tools for verification
+- Use think tool for planning and reflection
+
+**Tool best practices:**
+- Read files before editing them
+- Use exact values provided by the user
+- Don't make up values for optional parameters
+- If patches fail, re-read and retry
+- Use search to find all occurrences before making changes
+
+## Core Principles Summary
+
+1. **Problem statement is the source of truth**
+2. **Generate initial solutions first for new features** - then iterate to perfection
+3. **Test rigorously and frequently** - this is the #1 failure prevention
+4. **Handle edge cases explicitly** - don't assume they're covered
+5. **Fix root causes, not symptoms** - trace to the source
+6. **Make incremental changes** - small, testable steps
+7. **Copy working patterns** - leverage what already works
+8. **Search comprehensively** - fix all instances of systemic issues
+9. **Be thorough and systematic** - follow the workflow step by step
+10. **Think before acting** - plan and reflect extensively
+11. **Never give up** - iterate until the solution is perfect
+
+## Remember
+
+- Your thinking should be thorough - it's fine if it's very long
+- Think step by step before and after each action
+- When you say you'll make a tool call, ACTUALLY make it
+- The problem can definitely be solved without the internet
+- Take your time and think through every step
+- Check your solution rigorously and watch for boundary cases
+- Your solution must be perfect - if not, keep iterating
+- Hidden tests exist and must pass
+- Don't assume the task is complete when visible tests pass
+- Continue refining until confident the solution is robust and comprehensive
+- For new implementations, generate initial solution and tests first, then iterate
+- Both source code AND test files can contain errors - fix both as needed
+
+**GO SOLVE THE PROBLEM!**
     """
 
     SUMMARIZING_INSTRUCTION = """
-    You are a summarization expert.
-    You will be given an interaction history between the LLM (assistant role) and tool calls (tool role). This history represents part of an SWE agent's reasoning process while working on a specific software engineering task.
+You are a summarization expert.
+You will be given an interaction history between the LLM (assistant role) and tool calls (tool role). This history represents part of an SWE agent's reasoning process while working on a specific software engineering task.
 
-    Your job is to summarize this reasoning history by removing any content that is not useful for understanding progress toward solving the task.
+Your job is to summarize this reasoning history by removing any content that is not useful for understanding progress toward solving the task.
 
-    Output Format:
-    1. Relevant directory/file structures  
-    Provide only the directory and file structures that are pertinent to the task.
+Output Format:
+1. Relevant directory/file structures  
+Provide only the directory and file structures that are pertinent to the task.
 
-    2. Relevant code snippets  
-    Include all code snippets from the history that matter for solving the task.  
-    Each snippet must be preceded by its file path and line range.
+2. Relevant code snippets  
+Include all code snippets from the history that matter for solving the task.  
+Each snippet must be preceded by its file path and line range.
 
-    3. What the assistant was doing and why  
-    Provide a concise semantic summary describing the assistant's actions and the purpose behind them.
+3. What the assistant was doing and why  
+Provide a concise semantic summary describing the assistant's actions and the purpose behind them.
 
-    Task the SWE agent is working on:
-    {}
+Task the SWE agent is working on:
+{}
     """
 
-    EVALUATE_PLANNER_RESULT = "Planning work is fully completed"
-
-    EVALUATE_CODER_RESULT = "Coding work is fully completed"
-
-    EVALUATE_TESTER_RESULT = "Testing work is fully completed"
-
     TOOL_CALL_FAULT_TOLERANT = """
-    You will evaluate an LLM-generated message to determine whether it contains an incomplete or malformed XML tool call.
-    The message may or may not relate to tool calling. Your task is to analyze the text, detect whether any tool call is present, and—if so—extract and normalize it into a corrected JSON representation.
+You will evaluate an LLM-generated message to determine whether it contains an incomplete or malformed XML tool call.
+The message may or may not relate to tool calling. Your task is to analyze the text, detect whether any tool call is present, and—if so—extract and normalize it into a corrected JSON representation.
 
-    Return format (return only the JSON object, with no additional explanation):
-    ```JSON
-    {
-        "content": string,    // The reasoning or narrative text outside of the XML tool call, cleaned and de-duplicated
-        "tool_calls": [       // Extracted and normalized tool call data
-            {
-                "name": string,       // Tool name
-                "arguments": [        // Tool arguments list
-                    {
-                        "name": string,   // Argument name
-                        "value": any      // Argument value
-                    }
-                ]
-            }
-        ]
-    }
-    ```
+Return format (return only the JSON object, with no additional explanation):
+```JSON
+{
+    "content": string,    // The reasoning or narrative text outside of the XML tool call, cleaned and de-duplicated
+    "tool_calls": [       // Extracted and normalized tool call data
+        {
+            "name": string,       // Tool name
+            "arguments": [        // Tool arguments list
+                {
+                    "name": string,   // Argument name
+                    "value": any      // Argument value
+                }
+            ]
+        }
+    ]
+}
+```
 
-    Additional rules:
-        - Detect and correct anomalies in the "content" field, such as repeated reasoning segments; ensure the content is clean and appears only once.
-        - If no tool call is detected, the "tool_calls" field must be an empty array.
-        - Field names must match the specified schema exactly.
+Additional rules:
+    - Detect and correct anomalies in the "content" field, such as repeated reasoning segments; ensure the content is clean and appears only once.
+    - If no tool call is detected, the "tool_calls" field must be an empty array.
+    - Field names must match the specified schema exactly.
+    """
+
+    DETECT_PROGRAMMING_LANGUAGE = """
+Your task is to detect programming language of provided code snippet.
+Analyze the code and determine which programming language it is written in.
+Return ONLY the language name in lowercase.
+If you cannot determine the language, return "unknown".
+
+Return ONLY the language name in **lowercase**, no other text or explanation.
     """
 
 
@@ -1932,6 +2514,7 @@ async def _execute_agent_logic_async(
     max_retries = 3
 
     async def execute_async(retries: int = 0) -> Dict[str, Any]:
+        error = None
         try:
             # Set up timeout handler
             timeout_handler = TimeoutHandler(timeout_seconds)
@@ -1941,78 +2524,28 @@ async def _execute_agent_logic_async(
             Config.logger.info(f"[PROBLEM STATEMENT]: {problem_statement[:200]}...")
 
             # Create planner and tester agents with timeout handler
-            planner = Agent(
-                Prompts.PLANNING_INSTRUCTION,
+            agent = Agent(
+                Prompts.REASONING_INSTRUCTION,
                 problem_statement,
-                Prompts.EVALUATE_PLANNER_RESULT,
-                "planning",
                 repo_dir,
                 timeout_handler=timeout_handler,
             )
 
-            # tester = Agent(
-            #     Prompts.TESTING_INSTRUCTION,
-            #     problem_statement,
-            #     Prompts.EVALUATE_TESTER_RESULT,
-            #     "testing",
-            #     repo_dir,
-            #     timeout_handler=timeout_handler,
-            # )
-
-            # # Execute planner and tester in parallel
-            # Config.logger.info(
-            #     "[PARALLEL EXECUTION]: Starting planner and tester in parallel"
-            # )
-            # planner_task = asyncio.get_event_loop().run_in_executor(
-            #     None, planner.execute
-            # )
-            # tester_task = asyncio.get_event_loop().run_in_executor(None, tester.execute)
-
-            # await asyncio.gather(planner_task, tester_task)
-            # Config.logger.info("[PARALLEL EXECUTION]: Planner and tester completed")
-
-            # if not planner.result:
-            #     Config.logger.error(
-            #         f"[PLANNER FAILURE]: Planner agent failed. Last response: {planner.messages[-1]['content'] if planner.messages else 'No messages'}"
-            #     )
-            #     raise CustomError(
-            #         ErrorType.PLANNER_FAILED,
-            #         f"Planner agent failed. Last response: {planner.messages[-1]['content'] if planner.messages else 'No messages'}",
-            #     )
-
-            planner.execute()
-            Config.logger.info(f"[PLANNER RESULT]: {planner.result}")
-
-            # if not tester.result:
-            #     Config.logger.error(
-            #         f"[TESTER FAILURE]: Tester agent failed. Last response: {tester.messages[-1]['content'] if tester.messages else 'No messages'}"
-            #     )
-            #     raise CustomError(
-            #         ErrorType.TESTER_FAILED,
-            #         "Tester agent failed. Last response: {tester.messages[-1]['content'] if tester.messages else 'No messages'}",
-            #     )
-
-            # Config.logger.info(f"[TESTER RESULT]: {tester.result}")
-
-            # Create coder agent with same timeout handler
-            coder = Agent(
-                Prompts.CODING_INSTRUCTION,
-                f"This is task plan:\n{planner.result}\n",
-                Prompts.EVALUATE_CODER_RESULT,
-                "coding",
-                repo_dir,
-                timeout_handler=timeout_handler,
-            )
-            coder.execute()
-            Config.logger.info(f"[FINISHED RESULT]: {coder.result}")
-
-            return {"success": True, "result": coder.result}
+            agent.execute()
+            Config.logger.info(f"[AGENT RESULT]:")
+            return {"success": True}
         except CustomError as e:
             if e.error_type == ErrorType.AGENT_TIMEOUT:
                 Config.logger.error(f"[TIMEOUT ERROR]: {e.message}")
                 return {"success": False, "error": "timeout", "message": str(e)}
             else:
                 Config.logger.error(f"[CUSTOM ERROR]: {e}")
+                error = f"CustomError {str(e.error_type.value)} - {str(e)}"
+        except Exception as e:
+            Config.logger.error(f"[UNEXPECTED ERROR]: {e}")
+            error = f"UnknownError {str(e)}"
+        finally:
+            if error:
                 if retries < max_retries:
                     Config.logger.warning(
                         f"[RETRYING]: Attempt {retries + 1}/{max_retries}"
@@ -2021,34 +2554,11 @@ async def _execute_agent_logic_async(
                 else:
                     return {
                         "success": False,
-                        "error": str(e.error_type.value),
-                        "message": str(e),
+                        "error": error,
                     }
-        except Exception as e:
-            Config.logger.error(f"[UNEXPECTED ERROR]: {e}")
-            if retries < max_retries:
-                Config.logger.warning(
-                    f"[RETRYING]: Attempt {retries + 1}/{max_retries}"
-                )
-                return await execute_async(retries + 1)
-            else:
-                return {"success": False, "error": "exception", "message": str(e)}
 
     # Start execution with retry logic
     return await execute_async()
-
-
-def _execute_agent_logic(
-    input_dict: Dict[str, Any],
-    repo_dir: str,
-    timeout_seconds: int,
-) -> Dict[str, Any]:
-    """
-    Synchronous wrapper for async agent logic execution.
-    """
-    return asyncio.run(
-        _execute_agent_logic_async(input_dict, repo_dir, timeout_seconds)
-    )
 
 
 def agent_main(input_dict: Dict[str, Any], repo_dir: str = "repo") -> str:
@@ -2096,11 +2606,13 @@ def agent_main(input_dict: Dict[str, Any], repo_dir: str = "repo") -> str:
     )
 
     # Execute agent logic directly (timeout handled internally via TimeoutHandler)
-    execution_result = _execute_agent_logic(input_dict, repo_dir, Config.AGENT_TIMEOUT)
+    execution_result = asyncio.run(
+        _execute_agent_logic_async(input_dict, repo_dir, Config.AGENT_TIMEOUT)
+    )
 
     if not execution_result.get("success"):
         Config.logger.error(
-            f"[EXECUTION FAILED] Error: {execution_result.get('error')} - {execution_result.get('message', '')}"
+            f"[EXECUTION FAILED] Error: {execution_result.get('error')}"
         )
 
     return Utils.get_git_patch()
