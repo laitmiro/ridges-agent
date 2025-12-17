@@ -8,6 +8,8 @@ import logging
 import json
 import asyncio
 import traceback
+import time
+import textwrap
 from datetime import datetime
 from enum import Enum
 from json import JSONDecodeError
@@ -77,18 +79,18 @@ class Config:
 
     TEMPERATURE_BY_MODEL_TASK = {
         MODEL_GLM_46: {
-            TaskType.REASONING: (0.3, 0.7),
-            TaskType.THINKING: (0.0, 0.2),
+            TaskType.REASONING: (0.1, 0.3),
+            TaskType.THINKING: (0.3, 0.7),
             TaskType.ANSWERING: (0.0, 0.3),
         },
         MODEL_KIMI_K2: {
-            TaskType.REASONING: (0.3, 0.7),
-            TaskType.THINKING: (0.0, 0.2),
+            TaskType.REASONING: (0.1, 0.3),
+            TaskType.THINKING: (0.3, 0.7),
             TaskType.ANSWERING: (0.0, 0.3),
         },
         MODEL_QWEN3_CODER: {
-            TaskType.REASONING: (0.3, 0.7),
-            TaskType.THINKING: (0.0, 0.2),
+            TaskType.REASONING: (0.1, 0.3),
+            TaskType.THINKING: (0.3, 0.7),
             TaskType.ANSWERING: (0.0, 0.3),
         },
     }
@@ -112,24 +114,8 @@ class Config:
     }
 
     VERSION_COMPATIBILITY_FIX = """
-    import sys, pytest, collections, collections.abc, urllib3.exceptions, _pytest.pytester, numpy;
-    collections.Mapping = collections.abc.Mapping;
-    collections.MutableMapping = collections.abc.MutableMapping;
-    collections.MutableSet = collections.abc.MutableSet;
-    collections.Sequence = collections.abc.Sequence;
-    collections.Callable = collections.abc.Callable;
-    collections.Iterable = collections.abc.Iterable;
-    collections.Iterator = collections.abc.Iterator;
-    urllib3.exceptions.SNIMissingWarning = urllib3.exceptions.DependencyWarning;
-    pytest.RemovedInPytest4Warning = DeprecationWarning;
-    _pytest.pytester.Testdir = _pytest.pytester.Pytester;
-    numpy.PINF = numpy.inf;
-    numpy.unicode_ = numpy.str_;
-    numpy.bytes_ = numpy.bytes_;
-    numpy.float_ = numpy.float64;
-    numpy.string_ = numpy.bytes_;
-    numpy.NaN = numpy.nan;
-    """
+import sys, pytest, collections, collections.abc, urllib3.exceptions, _pytest.pytester, numpy;collections.Mapping = collections.abc.Mapping;collections.MutableMapping = collections.abc.MutableMapping;collections.MutableSet = collections.abc.MutableSet;collections.Sequence = collections.abc.Sequence;collections.Callable = collections.abc.Callable;collections.Iterable = collections.abc.Iterable;collections.Iterator = collections.abc.Iterator;urllib3.exceptions.SNIMissingWarning = urllib3.exceptions.DependencyWarning;pytest.RemovedInPytest4Warning = DeprecationWarning;_pytest.pytester.Testdir = _pytest.pytester.Pytester;numpy.PINF = numpy.inf;numpy.unicode_ = numpy.str_;numpy.bytes_ = numpy.bytes_;numpy.float_ = numpy.float64;numpy.string_ = numpy.bytes_;numpy.NaN = numpy.nan;
+"""
 
     logger = setup_logger()
 
@@ -783,7 +769,7 @@ class Utils:
 
         if not output.strip():
             return f"{result_prefix} No matches found for pattern in codebase."
-        if Utils.count_tokens(output) > 3000:
+        if cls.count_tokens(output) > 3000:
             return f"{result_prefix} Search results are too long. Please refine your search term into more specific terms."
         return output
 
@@ -1313,6 +1299,346 @@ class Utils:
             )
         return ""
 
+    @classmethod
+    def _extract_and_write_files(
+        cls, initial_solution: str, base_dir: str = "."
+    ) -> list:
+        def extract_file_names_using_llm(initial_solution: str) -> list:
+            file_names_prompt = f"""
+            Extract the file names from the initial solution. Return only the file names in a list only.
+            This is the initial solution:
+            ```
+            {initial_solution}
+            ```
+            Return only the file names in a list.
+            Example:
+            ```
+            ["a.py", "b.js"]
+            ```
+            """
+            result = cls.inference(
+                [{"role": "user", "content": file_names_prompt}],
+                Config.TaskType.ANSWERING,
+                "none",
+                max_retries=10,
+            )
+            if not result:
+                return []
+            return json.loads(result.replace("```json", "").replace("```", "").strip())
+
+        if not initial_solution.strip():
+            return []
+        file_names = extract_file_names_using_llm(initial_solution)
+        created_files = []
+        current_file, content = None, []
+
+        def write_file():
+            if current_file and content:
+                path = os.path.join(base_dir, current_file)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="utf-8") as f:
+                    file_content = "\n".join(content)
+                    file_content = (
+                        file_content.rstrip() + "\n"
+                        if file_content.strip()
+                        else file_content
+                    )
+                    f.write(file_content)
+                created_files.append(path)
+
+        filename_set = set(file_names)
+        for fname in file_names:
+            filename_set.add(fname.split("/")[-1])
+        for line in initial_solution.split("\n"):
+            stripped = line.strip()
+            if stripped in filename_set:
+                write_file()
+                current_file = next(
+                    (
+                        f
+                        for f in file_names
+                        if f == stripped
+                        or f.endswith("/" + stripped)
+                        or f.split("/")[-1] == stripped
+                    ),
+                    stripped,
+                )
+                current_file, content = current_file, []
+            elif current_file:
+                content.append(line)
+        write_file()
+        return created_files
+
+    @classmethod
+    def _extract_core_concepts_for_search(cls, problem_statement: str) -> dict:
+        EXTRACT_CONCEPTS_PROMPT = textwrap.dedent(
+            """
+            You are an expert at analyzing programming problems and extracting their core concepts.
+            Your task is to identify the fundamental concepts and domain of the problem using the exact terminology from the problem statement.
+            
+            Rules:
+            1. Identify the core domain related to the problem statement.
+            2. Extract key algorithmic concepts related to the problem statement.
+            3. Identify common edge cases that similar problems typically have
+            4. Can use synonyms, related terms, or broader categories instead of exact words from the problem
+            5. Focus on what types of inputs/outputs and validation might be needed
+            
+            Return a JSON object with:
+            - "search_terms": array of 2-4 search terms
+            - "domain": the problem domain in general terms
+            - "common_edge_cases": array of typical edge cases for this type of problem
+        """
+        )
+        messages = [
+            {"role": "system", "content": EXTRACT_CONCEPTS_PROMPT},
+            {"role": "user", "content": f"Problem Statement:\n{problem_statement}"},
+        ]
+        response = cls.inference(
+            messages, Config.TaskType.THINKING, "none", max_retries=10
+        )
+        json_match = re.search(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", response, re.DOTALL)
+        if json_match:
+            try:
+                concepts = json.loads(json_match.group(0))
+                if isinstance(concepts, dict) and "search_terms" in concepts:
+                    return concepts
+            except json.JSONDecodeError:
+                code_block_match = re.search(
+                    r"```(?:json)?\s*(\{.*?\})\s*```", response, re.DOTALL
+                )
+                if code_block_match:
+                    try:
+                        concepts = json.loads(code_block_match.group(1))
+                        if isinstance(concepts, dict) and "search_terms" in concepts:
+                            return concepts
+                    except json.JSONDecodeError:
+                        pass
+        return {"search_terms": [], "domain": "", "common_edge_cases": []}
+
+    @classmethod
+    def _clean_code_response(response: str) -> str:
+        response = response.strip()
+        response = re.sub(r"^```[\w-]*\n?", "", response, count=1)
+        response = response.removesuffix("```").strip()
+        return response
+
+    @classmethod
+    def _generate_initial_solution(cls, problem_statement: str) -> str:
+        print("[GENERATE_INITIAL_SOLUTION] Starting solution generation")
+        concepts = cls._extract_core_concepts_for_search(problem_statement)
+        edge_case_guidance = ""
+        if concepts.get("common_edge_cases"):
+            edge_case_guidance = (
+                f"\n\n**Common Edge Cases to Consider (based on similar problems):**\n"
+            )
+            for i, case in enumerate(concepts.get("common_edge_cases", []), 1):
+                edge_case_guidance += f"{i}. {case}\n"
+
+        GENERATE_SOLUTION_WITH_MULTI_STEP_REASONING_PROMPT = (
+            textwrap.dedent(
+                """
+            You are an expert software engineer. Your task is to generate a complete, working solution for the given problem statement.
+            Strict Requirements:
+            1. Output the full content of files along with their file names. You **MUST** output the **file name** along with file content.
+            2. Do not include explanations, comments, or markdown formatting in the main code.
+            3. Use only standard libraries and frameworks (no external libraries).
+            4. Implement all required classes and functions exactly with the same names as in the initial code stub.
+            5. You may add helper functions or classes if needed, but do not remove or rename the original ones.
+            6. Ensure the solution handles all edge cases, validates inputs, and produces correct outputs.
+            7. The solution must be executable as-is with no placeholders or TODOs.
+            8. **IMPORTANT**: Add clear comments above each edge case handling section to identify which specific edge case is being addressed. Use the format: `# Edge Case: [description of the edge case]`
+            9. **IMPORTANT**: Design your code to robustly handle input in all possible formats-implement logic to detect and preprocess various valid input types so the program works regardless of input format.
+            10. **IMPORTANT**: Add a comment at the end of each function/class that lists all edge cases handled, using the format: `# Handled Edge Cases: [list of edge cases]`
+
+            Return only the final code.
+            Response Examples:
+            ```python
+            a.py
+            {{content}}
+            b.py
+            {{content}}
+            ```
+            """
+            )
+            + edge_case_guidance
+        )
+        INFINITE_LOOP_CHECK_PROMPT = textwrap.dedent(
+            """
+            You are an expert code reviewer specializing in infinite loop detection and prevention. Your task is to analyze the generated code for potential infinite loops and provide a corrected version if issues are found.
+            CRITICAL INFINITE LOOP DETECTION:
+            1. Check for while True: loops without guaranteed exit conditions
+            2. Verify all while loops have clear termination conditions
+            3. Ensure recursive functions have proper base cases
+            4. Look for loops that depend on external state that might never change
+            5. Check for patterns that could lead to infinite iteration
+            If you find potential infinite loops:
+            - Provide a corrected version of the code
+            - Ensure all loops have finite termination conditions
+            - Add reasonable iteration limits or timeout mechanisms where appropriate
+            If no infinite loops are detected:
+            - Return the original code unchanged
+            STRICT REQUIREMENT: Return the final code along with file names. Do not include any explanations, comments, or additional text.
+            example:
+            ```python
+            a.py
+            {{content}}
+            b.py
+            {{content}}
+            ```
+        """
+        )
+        retry = 0
+        code_generation_messages = [
+            {
+                "role": "system",
+                "content": GENERATE_SOLUTION_WITH_MULTI_STEP_REASONING_PROMPT,
+            },
+            {
+                "role": "user",
+                "content": f"Problem Statement:\n{problem_statement}\n\nGenerate the complete and correct implementation in files.\n\nSTRICT REQUIREMENT: - You **MUST** output the **file name** along with file content.\nexample:\n```python\na.py\ncontents of a.py\n\nb.py\ncontents of b.py\n```",
+            },
+        ]
+
+        while retry < 10:
+            try:
+                code_response = cls.inference(
+                    code_generation_messages,
+                    Config.TaskType.THINKING,
+                    "none",
+                    max_retries=1,
+                )
+                loop_check_messages = [
+                    {"role": "system", "content": INFINITE_LOOP_CHECK_PROMPT},
+                    {
+                        "role": "user",
+                        "content": f"Generated Code:\n{code_response}\n\nAnalyze this code for potential infinite loops and provide a corrected version if any issues are found. Return ONLY the final code.",
+                    },
+                ]
+                loop_check_response = cls.inference(
+                    loop_check_messages, Config.TaskType.THINKING, "none", max_retries=1
+                )
+
+                solution = cls._clean_code_response(loop_check_response)
+                return solution
+            except Exception as e:
+                retry += 1
+                time.sleep(1)
+        if retry >= 10:
+            return ""
+        return ""
+
+    @classmethod
+    def _write_one_solution(cls, problem_statement: str) -> List[str]:
+        initial_solution = None
+        while not initial_solution:
+            initial_solution = cls._generate_initial_solution(problem_statement)
+            if not initial_solution:
+                print("[INITIAL SOLUTION RETRY]")
+                time.sleep(2)
+        created_files = cls._extract_and_write_files(initial_solution)
+        created_file_paths = [file_path for file_path in created_files if file_path]
+        Config.logger.info(f"[INITIAL SOLUTION] {initial_solution}")
+        return created_file_paths
+
+    @classmethod
+    def _generate_single_testset(
+        cls,
+        problem_statement: str,
+        files_to_test: str,
+    ) -> str:
+        """Generate a single test set and return testcode as string"""
+        GENERATE_TESTCASES_PROMPT = textwrap.dedent(
+            """
+            You are an expert testcase developer.
+                Important points:-
+                - Follow the best practices and conventions of the language of the code skeleton.
+                - you have generation limit of 2048 tokens. Hence you must stop generating more test cases when you are near the limit.
+                - If you get syntax error, check if last assistant response was truncated. If yes, then skip last couple of test cases to fit in.
+                - Use the only built-in testing framework for the language of the code skeleton. **MUST** use the built-in testing framework.
+                    - For python, use `unittest` to write a test.
+                    - For javascript, **MUST** use **`node:test` and `node:assert`** to write a test.
+                    - For other languages, use built-in test frameworks as well.
+                You must respond directly with the test cases in the following format.
+                =========TEST_CASES
+                <<test cases>>
+                Do not include anything else. For Example (JavaScript):
+                =========TEST_CASES
+                import { test } from 'node:test';
+                import assert from 'node:assert/strict';
+                import { main_func } from './main_module.js';
+                test('main_func should return expected output', () => {
+                    assert.strictEqual(main_func(), 'expected_output');
+                });
+            """
+        )
+        retry = 0
+        test_generation_messages = [
+            {"role": "system", "content": GENERATE_TESTCASES_PROMPT},
+            {
+                "role": "user",
+                "content": f"Problem Statement:\n{problem_statement}\n\nFiles To Test: {files_to_test}\n\nGenerate the complete and correct testcases.\n\nSTRICT REQUIREMENT: You **MUST** output the **file name** along with file content.\nexample:\n```python\ntest_a.py\ncontents of test_a.py\n\ntest_b.py\ncontents of test_b.py\n```\n```javascript\ntest_a.js\ncontents of test_a.js\n\ntest_b.js\ncontents of test_b.js\n```",
+            },
+        ]
+        while retry < 10:
+            try:
+                testcode_response = cls.inference(
+                    test_generation_messages, Config.TaskType.ANSWERING, "none"
+                )
+                testcases = cls._clean_code_response(testcode_response)
+                if not testcases or not testcases.strip():
+                    retry += 1
+                    continue
+                lines = testcases.split("\n")
+                if not lines or len(lines) == 0:
+                    retry += 1
+                    test_generation_messages.append(
+                        {"role": "assistant", "content": testcode_response}
+                    )
+                    test_generation_messages.append(
+                        {
+                            "role": "user",
+                            "content": f"Include file name in the response. example:\n```python\ntest_a.py\n{{content}}\n\ntest_b.py\n{{content}}\n```\n```javascript\ntest_a.js\n{{content}}\n\ntest_b.js\n{{content}}\n```",
+                        }
+                    )
+                    continue
+                return testcases
+            except Exception as e:
+                retry += 1
+                Config.logger.error(f"[TEST SINGLE GEN FAILURE]: {e}")
+                time.sleep(2)
+        return ""
+
+    @classmethod
+    def _write_one_testset(
+        cls,
+        problem_statement: str,
+        created_files: list,
+    ) -> List[str]:
+        created_file_paths = created_files
+        test_cases = None
+        while not test_cases:
+            test_cases = cls._generate_single_testset(
+                problem_statement, str(created_file_paths)
+            )
+            if not test_cases:
+                Config.logger.warning(
+                    "[WRITING TESTSET RETRY] Failed to generate test cases, retrying..."
+                )
+                time.sleep(2)
+
+        test_files = cls._extract_and_write_files(test_cases)
+        test_file_paths = [file_path for file_path in test_files if file_path]
+        Config.logger.info(f"[WRITING TESTSET] {test_cases}")
+        return test_file_paths
+
+    @classmethod
+    def _process_create_task(cls, problem_statement):
+        solution_files = cls._write_one_solution(problem_statement)
+        test_files = cls._write_one_testset(
+            problem_statement, solution_files, temperature=0.1
+        )
+        return f"Implemented initial solution to {"\n".join(solution_files)}.\nTest files are {"\n".join(test_files)}"
+
 
 class Tools:
     ALL_TOOLS = {
@@ -1321,7 +1647,13 @@ class Tools:
         "create_file",
         "edit_file",
         "search",
+        "search_in_all_files_content",
         "run_bash_command",
+        "run_code",
+        "get_function_body",
+        "think",
+        "finish",
+        "generate_initial_solution",
     }
 
     def __init__(self):
@@ -1683,9 +2015,9 @@ class Tools:
         Do not use this tool to create test or files to reproduce the error unless user has specifically asked you to create test files as part of problem statement.
 
         Arguments:
-            content: text code to write in file
-            file_path: path of the file to save the code in. This file should always be in the current working directory.
-            run_command: command to run the file (i.e., ["python", "file.py"] or ["node", "file.js"] etc)
+            content: Text code to write in file.
+            file_path: Path of the file to save the code in. This file should always be in the current working directory.
+            run_command: Command to run the file (i.e., ["python", "file.py"] or ["node", "file.js"] etc)
         """
         return Utils._run_code(
             content,
@@ -1697,13 +2029,26 @@ class Tools:
     def get_function_body(cls, file_path: str, function_name: str) -> str:
         """
         Retrieves the complete body of a function from a file, including decorators.
+        It returns empty string if function not found.
+
         Arguments:
-            file_path: filesystem path to target file.
-            function_name: name of the function to retrieve (supports both qualified names like "ClassName.method_name" and simple names like "method_name").
-        Returns:
-            The complete function body including decorators, or empty string if function not found.
+            file_path: Filesystem path to target file.
+            function_name: Name of the function to retrieve (supports both qualified names like "ClassName.method_name" and simple names like "method_name").
         """
         return Utils._get_function_body(file_path, function_name, add_line_numbers=True)
+
+    @classmethod
+    def generate_initial_solution(cls, problem_statement: str) -> str:
+        """
+        IMPORTANT: Use this tool if you work on implementing tasks from scratch, not bug fixing.
+        A creation task involves building a brand-new implementation in an empty repository or completing a skeleton codebase that contains only function signatures or minimal scaffolding.
+        Creation tasks do NOT include bug fixes or minor modifications to existing logic.
+        This tool generates an initial, fully functional implementation along with a corresponding test suite, and applies all required file creations and edits.
+
+        Arguments:
+            problem_statement: A complete instruction describing the solution to generate. This must include all relevant context, including the task description, target file paths, existing file contents, and the specific files to be created or modified.
+        """
+        return Utils._process_create_task(problem_statement)
 
     @classmethod
     def think(cls, thought: str) -> str:
@@ -1915,7 +2260,7 @@ This is inference history.
     def execute(self):
         tool_mode = "auto"
         tools = Tools.documentation()
-        max_retries = 5
+        max_retries = 3
         retries = 0
 
         while True:
@@ -1985,12 +2330,23 @@ This is inference history.
             tool_call_outputs = []
 
             if self._check_and_rebase_repeated_tool_call():
+                retries += 1
                 if retries < max_retries:
-                    retries += 1
                     Config.logger.warning(
                         f"[REBASE REPEATED]: ({retries}/{max_retries})"
                     )
                     continue
+                else:
+                    self.messages.append(
+                        {
+                            "role": "tool",
+                            "content": "Do NOT repeat same tool calls with the same arguments.",
+                        }
+                    )
+                    retries = 0
+                    continue
+            else:
+                retries = 0
 
             for tool_call in response["tool_calls"]:
                 tool_name = tool_call["name"]
