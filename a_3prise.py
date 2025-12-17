@@ -1014,6 +1014,8 @@ class Utils:
         """
         Execute a bash command and return its stdout.
         """
+        if not command:
+            raise CustomError(ErrorType.INVALID_PARAMETER, "command argument is empty")
         try:
             result = subprocess.run(
                 command,
@@ -1058,13 +1060,26 @@ class Utils:
     @classmethod
     def _run_code(
         cls,
-        content: str,
         file_path: str,
         run_command: list[str],
+        content: str = "",
     ) -> str:
         result_prefix = f"Result of running {" ".join(run_command)}\n"
 
-        if file_path.endswith((".py", ".pyw", ".pyx", ".pyi", ".pxd", ".pxi", ".pyz")):
+        if not content:
+            if not os.path.exists(file_path):
+                return f"{result_prefix} Error: No content and file to run"
+            else:
+                with open(file_path, "r") as f:
+                    content = f.read()
+
+        if not run_command:
+            return f"{result_prefix} Error: run_command not provided"
+
+        if (
+            file_path.endswith((".py", ".pyw", ".pyx", ".pyi", ".pxd", ".pxi", ".pyz"))
+            and Config.VERSION_COMPATIBILITY_FIX not in content
+        ):
             content = Config.VERSION_COMPATIBILITY_FIX + "\n\n" + content
         cls._create_file(file_path, content)
         try:
@@ -2008,21 +2023,22 @@ class Tools:
             return f"Error [{e.error_type.value}]: {e.message}"
 
     @classmethod
-    def run_code(cls, content: str, file_path: str, run_command: list[str]) -> str:
+    def run_code(cls, file_path: str, run_command: list[str], content: str = "") -> str:
         """
         Runs any code. You can use this tool directly to run any test code or bug reproduction code.
         Saves the code at the given file_path and then runs it.
+        If code not provided, runs existing code in the given file_path.
         Do not use this tool to create test or files to reproduce the error unless user has specifically asked you to create test files as part of problem statement.
 
         Arguments:
-            content: Text code to write in file.
-            file_path: Path of the file to save the code in. This file should always be in the current working directory.
-            run_command: Command to run the file (i.e., ["python", "file.py"] or ["node", "file.js"] etc)
+            file_path: Absolute path of the file to save the code in. This file should always be in the current working directory.
+            run_command: Command to run the file (i.e., ["python", "absolute/path/to/file.py"] or ["node", "absolute/path/to/file.js"] etc). Always include absolute path of the file in run_command.
+            content: Text code to write in file and execute. Defaults to "". If not provided, run the existing code in file_path.
         """
         return Utils._run_code(
-            content,
             file_path,
             run_command,
+            content,
         )
 
     @classmethod
@@ -2066,7 +2082,8 @@ class Tools:
     @classmethod
     def finish(cls):
         """
-        Signals completion of the current workflow execution
+        Signals completion of the current workflow execution.
+        Call this tool explicitly when you have finish your work.
         """
         return "finish"
 
@@ -2197,6 +2214,8 @@ This is inference history.
             + self.messages[self.base_length + self.summary_length :]
         )
 
+        Config.logger.info(f"[AFTER SUMMARIZATION]: {self.messages}")
+
     def _is_same_tool_calls(self, i: int, j: int) -> bool:
         return (
             self.tool_calls[i]["names"] == self.tool_calls[j]["names"]
@@ -2208,7 +2227,7 @@ This is inference history.
         self.messages = self.messages[: idx + 1]
         self.tool_calls = self.tool_calls[: i + 1]
 
-    def _check_and_rebase_repeated_tool_call(self) -> bool:
+    def _check_and_rebase_repeated_tool_call(self, rebase: bool = False) -> bool:
         max_repeat = 2
         for repeat in range(1, max_repeat + 1):
             if len(self.tool_calls) < repeat * 2:
@@ -2224,7 +2243,8 @@ This is inference history.
                     Config.logger.warning(
                         f"\t[TOOL CALL {i+1}]: {json.dumps(self.tool_calls[-repeat+i])}\n"
                     )
-                self._rebase_to_tool_call(-2 * repeat)
+                if rebase:
+                    self._rebase_to_tool_call(-2 * repeat)
                 return True
         return False
 
@@ -2304,6 +2324,10 @@ This is inference history.
 
             Config.logger.info(f"[INFERENCE CONTENT]: {response["content"]}")
 
+            if not response["tool_calls"]:
+                Config.logger.warning(f"[NO TOOL CALLS]: Retrying...")
+                continue
+
             if response["content"]:
                 self.messages.append(
                     {
@@ -2311,9 +2335,6 @@ This is inference history.
                         "content": response["content"],
                     }
                 )
-
-            if not response["tool_calls"]:
-                continue
 
             tool_name_list = [tool["name"] for tool in response["tool_calls"]]
             tool_args_list = [
@@ -2753,12 +2774,15 @@ You have a limited step budget:
 ## Tool Usage Guidelines
 
 **Choose the right tool:**
+- Always include at least one tool call in your response
 - Use file reading tools for understanding context
 - Use search tools to find patterns and similar code
 - Use edit tools for modifying existing files
 - Use write tools for generating initial solutions and new files
 - Use test execution tools for verification
 - Use think tool for planning and reflection
+- Use finish tool for signal of task completion
+- Bunch as many tool calls at once as possible
 
 **Tool best practices:**
 - Read files before editing them
