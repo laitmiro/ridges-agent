@@ -38,7 +38,7 @@ def setup_logger(name: str = "agent") -> logging.Logger:
 
     # Create timestamped log file
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = log_dir / f"agent_execution_{timestamp}.log"
+    log_file = log_dir / f"a_3prise_{timestamp}.log"
 
     # File handler - always writes to file
     file_handler = logging.FileHandler(log_file, mode="w", encoding="utf-8")
@@ -2324,10 +2324,6 @@ This is inference history.
 
             Config.logger.info(f"[INFERENCE CONTENT]: {response["content"]}")
 
-            if not response["tool_calls"]:
-                Config.logger.warning(f"[NO TOOL CALLS]: Retrying...")
-                continue
-
             if response["content"]:
                 self.messages.append(
                     {
@@ -2335,6 +2331,16 @@ This is inference history.
                         "content": response["content"],
                     }
                 )
+
+            if not response["tool_calls"]:
+                self.messages.append(
+                    {
+                        "role": "tool",
+                        "content": "Error. Expected at least one tool call.",
+                    }
+                )
+                Config.logger.warning(f"[NO TOOL CALLS]: Retrying...")
+                continue
 
             tool_name_list = [tool["name"] for tool in response["tool_calls"]]
             tool_args_list = [
