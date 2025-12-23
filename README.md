@@ -1,10 +1,10 @@
-# SWE Agent - Practical Software Engineering Agent
+# SWE Agent - Educational Software Engineering Agent
 
-> A production-ready agentic system designed to autonomously solve real-world software engineering tasks through intelligent code understanding, generation, and iterative refinement.
+> An educational agentic system built to explore and demonstrate autonomous software engineering workflows through intelligent code understanding, generation, and iterative refinement.
 
 ## Overview
 
-This SWE (Software Engineering) Agent is built for **practical, real-world application** in solving complex software engineering tasks. Unlike academic or experimental systems, this agent is designed with robustness, fault tolerance, and production reliability in mind.
+This SWE (Software Engineering) Agent is built as an **educational project** to explore agentic workflows for software engineering tasks. The goal is to experiment with and demonstrate concepts like autonomous problem-solving, multi-model inference, and intelligent tool use in a controlled learning environment.
 
 ### Key Capabilities
 
@@ -407,37 +407,37 @@ result = agent_main(
 
 ---
 
-## Practical Design Principles
+## Design Principles (Educational Focus)
 
-### 1. **Production Reliability**
+### 1. **Error Handling Exploration**
 
 - Comprehensive error handling with 20+ error types
 - Automatic retry logic with exponential backoff
 - Timeout protection to prevent runaway execution
 - Graceful degradation on model failures
 
-### 2. **Context Efficiency**
+### 2. **Context Management Techniques**
 
 - Automatic message summarization to manage token limits
 - Configurable retention windows (summary_length, retain_length)
 - Tool output truncation for large responses
 - Efficient codebase exploration with targeted reads
 
-### 3. **Intelligent Iteration**
+### 3. **Iterative Refinement**
 
 - Repeated tool call detection prevents infinite loops
 - Rebase mechanism to backtrack from failures
 - Incremental testing after each change
 - Root cause analysis for systematic debugging
 
-### 4. **Code Quality**
+### 4. **Code Quality Standards**
 
 - Type hints throughout codebase
 - Comprehensive docstrings with argument descriptions
 - Tree-sitter based code parsing for AST analysis
 - Git-based change tracking and patch generation
 
-### 5. **Observability**
+### 5. **Observability & Logging**
 
 - Structured logging with timestamps
 - Tool call tracing with arguments and outputs
@@ -569,13 +569,13 @@ Uses tree-sitter for:
 
 ## Contributing
 
-This agent is designed for **practical production use**. When contributing:
+This agent is designed as an **educational project** to explore agentic workflows. When contributing:
 
-1. **Maintain reliability** - Add error handling for new features
-2. **Preserve efficiency** - Optimize token usage and tool calls
-3. **Document thoroughly** - Update docstrings and README
-4. **Test comprehensively** - Validate against diverse codebases
-5. **Log appropriately** - Ensure observability
+1. **Maintain clarity** - Add error handling and clear explanations for new features
+2. **Preserve learning value** - Document design decisions and trade-offs
+3. **Document thoroughly** - Update docstrings and README with educational context
+4. **Test reasonably** - Validate core functionality
+5. **Log appropriately** - Ensure observability for learning purposes
 
 ---
 
@@ -596,4 +596,4 @@ Built with:
 
 ---
 
-**This agent is built for real-world software engineering tasks. It's designed to be reliable, efficient, and practical for production environments.**
+**This agent is built as an educational project to explore agentic workflows for software engineering tasks. It demonstrates concepts and techniques in autonomous problem-solving, not intended for production use.**
