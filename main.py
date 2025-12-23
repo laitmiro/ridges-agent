@@ -38,7 +38,7 @@ def setup_logger(name: str = "agent") -> logging.Logger:
 
     # Create timestamped log file
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = log_dir / f"a_3prise_{timestamp}.log"
+    log_file = log_dir / f"agent_{timestamp}.log"
 
     # File handler - always writes to file
     file_handler = logging.FileHandler(log_file, mode="w", encoding="utf-8")
